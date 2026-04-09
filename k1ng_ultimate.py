@@ -297,45 +297,125 @@ def fetch_fear_greed() -> Dict[str, Any]:
     return result
 
 
-@st.cache_data(ttl=10)
-def fetch_live_prices(symbols: List[str]) -> Dict[str, float]:
-    """Binance REST: Aktuelle Preise (Cache 10 Sek)."""
-    prices: Dict[str, float] = {}
-    for sym in symbols:
-        try:
-            r = requests.get(
-                f"https://api.binance.com/api/v3/ticker/price?symbol={sym}",
-                timeout=5
-            )
-            if r.status_code == 200:
-                prices[sym] = float(r.json().get("price", 0))
-        except Exception:
-            prices[sym] = 0.0
-    return prices
+# CoinGecko Asset Mapping (Binance Symbol -> CoinGecko ID)
+COINGECKO_ID_MAP = {
+    "BTCUSDT": "bitcoin",
+    "ETHUSDT": "ethereum",
+    "SOLUSDT": "solana",
+    "BNBUSDT": "binancecoin",
+    "XRPUSDT": "ripple",
+    "DOGEUSDT": "dogecoin",
+    "ADAUSDT": "cardano",
+    "AVAXUSDT": "avalanche-2",
+    "LINKUSDT": "chainlink"
+}
 
+# Reverse-Map für ID -> Symbol (optional, hier nicht zwingend nötig)
+SYMBOL_FROM_ID = {v: k for k, v in COINGECKO_ID_MAP.items()}
+@st.cache_data(ttl=30)  # 30 Sekunden Cache für Live-Preise
+def fetch_live_prices(symbols: List[str]) -> Dict[str, float]:
+    """
+    Holt aktuelle Preise von CoinGecko (statt Binance).
+    Fallback: 0.0 bei Fehlern.
+    """
+    prices: Dict[str, float] = {sym: 0.0 for sym in symbols}
+    
+    # Baue Liste der CoinGecko IDs aus den angeforderten Symbolen
+    coin_ids = []
+    for sym in symbols:
+        cg_id = COINGECKO_ID_MAP.get(sym)
+        if cg_id:
+            coin_ids.append(cg_id)
+        else:
+            st.warning(f"⚠️ Asset '{sym}' nicht in CoinGecko-Mapping gefunden.")
+    
+    if not coin_ids:
+        return prices
+        
+    # CoinGecko Simple Price Endpoint
+    ids_param = ",".join(coin_ids)
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids_param}&vs_currencies=usd"
+    
+    try:
+        r = requests.get(url, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            # Mapping zurück auf Binance-Symbole
+            for sym, cg_id in COINGECKO_ID_MAP.items():
+                if cg_id in data and "usd" in data[cg_id]:
+                    prices[sym] = float(data[cg_id]["usd"])
+        else:
+            print(f"CoinGecko Preis-Fehler: HTTP {r.status_code}")
+    except Exception as e:
+        print(f"CoinGecko Preis-Exception: {e}")
+    
+    return prices
 
 @st.cache_data(ttl=120)
 def fetch_klines(symbol: str, interval: str = "1h", limit: int = 200) -> pd.DataFrame:
-    """Binance Kerzendaten (Cache 2 Min)."""
-    try:
-        r = requests.get(
-            "https://api.binance.com/api/v3/klines",
-            params={"symbol": symbol, "interval": interval, "limit": limit},
-            timeout=10
-        )
-        if r.status_code != 200:
-            return pd.DataFrame()
-        raw = r.json()
-        df = pd.DataFrame(raw, columns=[
-            "open_time","open","high","low","close","volume",
-            "close_time","qav","trades","tbbav","tbqav","ignore"
-        ])
-        for col in ["open","high","low","close","volume"]:
-            df[col] = pd.to_numeric(df[col])
-        df["time"] = pd.to_datetime(df["open_time"], unit="ms")
-        return df[["time","open","high","low","close","volume"]].reset_index(drop=True)
-    except Exception:
+    """
+    Holt historische OHLC-Daten von CoinGecko.
+    Unterstützte Intervalle: '1h', '4h', '1d' (andere werden auf '1h' gemappt).
+    """
+    cg_id = COINGECKO_ID_MAP.get(symbol)
+    if not cg_id:
+        st.error(f"Asset '{symbol}' nicht für CoinGecko gemappt.")
         return pd.DataFrame()
+    
+    # Mapping von Streamlit-Auswahl auf CoinGecko 'vs_currency' und 'days'
+    interval_map = {
+        "15m": ("hourly", 7),   # 15m nicht direkt verfügbar -> wir holen 1h für 7 Tage
+        "1h":  ("hourly", 30),  # Max 90 Tage für hourly
+        "4h":  ("hourly", 90),  # Wir holen 90 Tage hourly und resampeln später auf 4h
+        "1d":  ("daily",  365)  # Max 365 Tage für daily
+    }
+    
+    cg_interval, days = interval_map.get(interval, ("hourly", 30))
+    
+    url = f"https://api.coingecko.com/api/v3/coins/{cg_id}/ohlc?vs_currency=usd&days={days}"
+    
+    try:
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200:
+            print(f"CoinGecko OHLC Fehler: HTTP {r.status_code} für {symbol}")
+            return pd.DataFrame()
+        
+        raw_data = r.json()
+        if not raw_data:
+            return pd.DataFrame()
+        
+        # CoinGecko liefert: [timestamp, open, high, low, close]
+        df = pd.DataFrame(raw_data, columns=["timestamp", "open", "high", "low", "close"])
+        df["time"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df = df[["time", "open", "high", "low", "close"]]
+        df["volume"] = 0  # CoinGecko OHLC enthält kein Volumen, wir setzen Dummy
+        
+        # Für 4h Intervall resampeln wir die 1h Daten
+        if interval == "4h":
+            df = df.set_index("time")
+            df_4h = df.resample("4H").agg({
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum"
+            }).dropna().reset_index()
+            df = df_4h
+            df["time"] = pd.to_datetime(df["time"])
+        else:
+            # Sicherstellen, dass time eine Spalte bleibt
+            df = df.reset_index(drop=True)
+        
+        # Auf die gewünschte Anzahl begrenzen
+        if len(df) > limit:
+            df = df.tail(limit)
+            
+        return df.reset_index(drop=True)
+        
+    except Exception as e:
+        print(f"CoinGecko OHLC Exception: {e}")
+        return pd.DataFrame()
+
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
